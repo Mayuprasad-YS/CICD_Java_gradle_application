@@ -50,15 +50,19 @@ pipeline {
         stage('Wait for Docker') {
             steps {
                 script {
-                    echo "Waiting for Docker daemon to be ready..."
-                    sh '''
-                        until docker info >/dev/null 2>&1; do
-                          echo "Waiting for Docker..."
-                          sleep 2
-                        done
-                    '''
-                    echo "Docker is ready!"
-                }
+                     echo "Waiting for Docker daemon to be ready..."
+                    retry(30) { // Retry for up to 30 attempts (sleeping 5s between = 150 seconds max)
+                     sh '''
+                    set -e
+                    if ! docker info >/dev/null 2>&1; then
+                      echo "Docker not ready yet, sleeping..."
+                      sleep 5
+                      exit 1
+                    fi
+                '''
+            }
+            echo "Docker daemon is ready!"
+        }
             }
         }
 
