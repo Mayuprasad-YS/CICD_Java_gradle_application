@@ -1,84 +1,96 @@
+def getDockerTag(){
+        def tag = sh (script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        return tag
+}
+
+def getAwsAccountId(){
+        def accountId = sh (script: 'aws sts get-caller-identity --query "Account" --output text', returnStdout: true).trim()
+        return accountId
+}
+
+
+
 pipeline {
     agent {
         label 'ec2-fleet'
     }
+
+    environment{
+	    Docker_tag = getDockerTag()
+        aws_account_id = getAwsAccountId()
+        aws_region = "us-east-1"
+    }
+
     stages {
-        stage('Prepare Environment') {
-            steps {
-                script {
-                    echo "Checking for Docker installation..."
+        stage('Build and Sonar parallel') {
+            parallel {
+                stage('Build') {
+                    steps {
+                        script {
+                            docker.image('openjdk:11').inside('--user root') {
+                                sh 'chmod +x gradlew'
+                                sh './gradlew build'
+                            }
+                        }
+                    }
+                }
 
-                    def dockerExists = sh(
-                        script: 'which docker || true',
-                        returnStdout: true
-                    ).trim()
-
-                    if (dockerExists == '') {
-                        echo "Docker not found. Installing Docker..."
-                        sh '''
-                            set -euxo pipefail
-                            apt-get update
-                            apt-get install -y \
-                                ca-certificates \
-                                curl \
-                                gnupg \
-                                lsb-release
-
-                            install -m 0755 -d /etc/apt/keyrings
-                            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-                                gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-                            chmod a+r /etc/apt/keyrings/docker.gpg
-
-                            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-                            https://download.docker.com/linux/ubuntu \
-                            $(lsb_release -cs) stable" | \
-                            tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-                            apt-get update
-                            apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-                            systemctl enable docker
-                            systemctl start docker
-                        '''
-                    } else {
-                        echo "Docker is already installed."
+                stage('sonar-scan') {
+                    steps {
+                        script {
+                            docker.image('openjdk:11').inside('--user root') {
+                            try {
+                                withSonarQubeEnv(credentialsId: 'sonar-token') {
+                                        sh 'chmod +x gradlew'
+                                        sh './gradlew sonarqube'
+                                }
+                            } catch (err) {
+                                currentBuild.result = 'unstable'
+                                echo "sonarQube scan failed, marking build as UNSTABLE. Error:${err}"
+                                return 
+                            }
+                            
+                            timeout(time: 1, unit: 'HOURS') {
+                              def qg = waitForQualityGate()
+                              if (qg.status != 'OK') {
+                                   error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                                 }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        stage('Wait for Docker') {
+        stage('docker-Build') {
             steps {
                 script {
-                     echo "Waiting for Docker daemon to be ready..."
-                    retry(30) { // Retry for up to 30 attempts (sleeping 5s between = 150 seconds max)
-                     sh '''
-                    set -e
-                    if ! docker info >/dev/null 2>&1; then
-                      echo "Docker not ready yet, sleeping..."
-                      sleep 5
-                      exit 1
-                    fi
-                '''
-            }
-            echo "Docker daemon is ready!"
-        }
+                        sh 'docker build -t spring-app:${Docker_tag} . '
+                        currentBuild.description = "spring-app:${Docker_tag}"
+                }
             }
         }
 
-        stage('Build') {
-            agent {
-                docker {
-                    image 'openjdk:11'
-                    args '-u root' // Important: allows the container to run as root, useful if permission issues
-                }
-            }
+        stage('docker-push') {
             steps {
                 script {
-                    sh 'chmod +x gradlew'
-                    sh './gradlew build'
+                        sh '''
+                            aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com
+                            docker tag spring-app:${Docker_tag} ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/spring-app:${Docker_tag}
+                            docker push ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/spring-app:${Docker_tag}
+                            docker rmi ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/spring-app:${Docker_tag} spring-app:${Docker_tag}
+                        '''
                 }
             }
         }
     }
+
+    post {
+		always {
+            archiveArtifacts artifacts: 'build/reports/tests/test/**', followSymlinks: false
+            publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'build/reports/tests/test/', reportFiles: 'index.html', reportName: 'test-case-report', reportTitles: 'test-case-report', useWrapperFileDirectly: true])
+			cleanWs()
+		 }
+	}
 }
