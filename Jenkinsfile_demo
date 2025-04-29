@@ -19,9 +19,40 @@ pipeline {
 	    Docker_tag = getDockerTag()
         aws_account_id = getAwsAccountId()
         aws_region = "us-east-1"
+        SONARQUBE_URL = "http://54.91.37.155:9000/"
     }
 
     stages {
+        stage('initial checks') {
+            parallel {
+                stage('Sanity-Check') {
+                    steps {
+                        echo 'Checking if SonarQube is up...'
+                        sh '''
+                            
+                            STATUS=$(curl --write-out "%{http_code}" --silent --output /dev/null ${SONARQUBE_URL}/api/system/health)
+
+                            if [ "$STATUS" -ne 200 ]; then
+                            echo "SonarQube is not reachable or unhealthy! Status code: $STATUS"
+                            exit 1
+                            fi
+
+                            echo "SonarQube is up and healthy!"
+                        '''
+                    }
+                }
+
+                stage("helath-check"){
+                    steps{
+                        script{
+                            sh 'chmod +x health-check.sh'
+                            sh './health-check.sh'
+                        }
+                    }
+                }
+            }
+        }
+
         stage('Build and Sonar parallel') {
             parallel {
                 stage('Build') {
@@ -84,7 +115,46 @@ pipeline {
                 }
             }
         }
+
+        stage('prepare helm chart') {
+            steps {
+                script {
+                        sh '''
+                            sed -i "s:IMAGE_NAME:${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/spring-app:" kubernetes/myapp/values.yaml
+                        sed -i "s:IMAGE_TAG:${Docker_tag}:" kubernetes/myapp/values.yaml
+                        helm package kubernetes/myapp/
+                        helmversion=$( helm show chart kubernetes/myapp/ | grep version | cut -d: -f 2 | tr -d ' ')
+                        aws s3 cp spring-app-$helmversion.tgz s3://s3-bucket-mayuprasad/helm-charts/spring-app-$helmversion.tgz
+                        '''
+                }
+            }
+        }
+
+        stage("deploy to eks cluster") {
+            steps {
+                script {
+                    dir('kubernetes') {
+                        docker.image('061051230603.dkr.ecr.us-east-1.amazonaws.com/spring-app:deploy').inside('--user root') {
+                            withCredentials([usernamePassword(credentialsId: 'aws-login', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                sh '''
+                                    mkdir -p /root/.aws
+                                    echo "[default]" > /root/.aws/config
+                                    echo "region = us-east-1" >> /root/.aws/config
+                                    export AWS_CONFIG_FILE="/root/.aws/config"
+                                    aws eks update-kubeconfig --region us-east-1 --name my-k8s-cluster1
+                                    helm upgrade --install myjavaapp myapp/
+                                    helm list 
+                                    sleep 120
+                                    kubectl get po 
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
 
     post {
 		always {
